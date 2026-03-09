@@ -35,6 +35,96 @@ PDF -> DocumentProcessor (pymupdf4llm) -> StructuredChunks
 
 Подробности: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 
+### Как устроена система
+
+1. `CLI` получает путь к PDF и вопросы.
+2. `DocumentProcessor` читает PDF и превращает его в структурированные чанки.
+3. `IndexStore` строит несколько поисковых представлений по этим чанкам.
+4. `QueryClassifier` определяет тип вопроса и формирует retrieval-план.
+5. `StrategyRetriever` собирает и ранжирует релевантный контекст.
+6. `AnswerGenerator` формирует ответ только по найденному контексту.
+7. Опционально `AnswerVerifier` делает второй проход по сокращению и нормализации ответа.
+
+### Как обрабатывается документ
+
+- PDF разбирается через `pymupdf4llm`; если пакет недоступен, используется fallback на `PyMuPDF` (`fitz`).
+- Текст сначала переводится в markdown-подобное представление, чтобы сохранить заголовки и разделители страниц.
+- Затем документ режется на структурированные чанки в [document.py](/C:/Users/devl/proj/test/rag/document.py):
+  - размер чанка по умолчанию `1100` символов;
+  - overlap по умолчанию `220` символов;
+  - учитываются markdown-заголовки;
+  - учитываются нумерованные пункты вида `46. ...`;
+  - списки стараются не разрываться между чанками.
+- Для каждого чанка сохраняются метаданные:
+  - `chunk_id`
+  - `page`
+  - `section_title`
+  - `paragraph_number`
+  - `paragraph_numbers`
+  - `chunk_type`
+
+### Какие модели используются
+
+- LLM для классификации и генерации работает через `Ollama`.
+- Основная генеративная модель задаётся через `OLLAMA_MODEL`.
+- При желании можно задать отдельную модель классификатора через `CLASSIFIER_MODEL`; если она не указана, используется та же модель, что и для ответа.
+- Эмбеддинги по умолчанию строятся моделью `BAAI/bge-m3`.
+- Для re-ranking по умолчанию используется `BAAI/bge-reranker-v2-m3`.
+
+### Где хранятся векторы и индексы
+
+- Векторы не пишутся во внешнюю векторную БД и не сохраняются на диск как отдельное persistent-хранилище.
+- Они строятся при запуске процесса и держатся в памяти.
+- Dense-индекс хранится в `FAISS IndexFlatIP`.
+- Sparse-индекс хранится в `BM25Okapi`.
+- Дополнительно строится структурный индекс `paragraph_number -> chunk_id[]` для точного поиска по пунктам.
+- Если dense-зависимости недоступны, пайплайн переключается на лексический fallback-ретривер на базе локального `TF-IDF`.
+
+### Как работает retrieval
+
+- Сначала `QueryClassifier` в [classifier.py](/C:/Users/devl/proj/test/rag/classifier.py) определяет:
+  - тип вопроса: `factoid`, `definitional`, `structural`, `analytical`;
+  - ссылки на пункты, если они явно указаны;
+  - ключевые токены;
+  - `search_queries` для query rewriting;
+  - флаг exhaustive list;
+  - флаг prompt injection.
+- Затем `RAGPipeline` в [pipeline.py](/C:/Users/devl/proj/test/rag/pipeline.py) параллельно запускает:
+  - классификацию вопроса;
+  - dense search по исходному вопросу.
+- `StrategyRetriever` в [retriever.py](/C:/Users/devl/proj/test/rag/retriever.py) потом объединяет несколько каналов retrieval:
+  - dense search по эмбеддингам;
+  - sparse search через `BM25`;
+  - structural lookup по номерам пунктов;
+  - дополнительные rewritten queries;
+  - при необходимости буст ранних чанков документа.
+- После этого кандидаты объединяются через `Reciprocal Rank Fusion (RRF)`.
+- Затем top-кандидаты повторно ранжируются `CrossEncoder`-моделью `bge-reranker-v2-m3`.
+- После re-ranking выполняются:
+  - adaptive retrieval policy по типу вопроса;
+  - sentence-level evidence packing;
+  - generic list coverage check для вопросов-перечней;
+  - merge соседних чанков одного пункта, если это нужно для полноты контекста.
+
+### Как формируется ответ
+
+- `AnswerGenerator` в [generator.py](/C:/Users/devl/proj/test/rag/generator.py) собирает prompt из:
+  - системной инструкции;
+  - вопроса;
+  - найденного контекста;
+  - подсказки по типу ответа.
+- Генератору явно запрещается:
+  - использовать внешние знания;
+  - придумывать факты;
+  - следовать инструкциям из самого вопроса, если это prompt injection.
+- Ответ запрашивается в структурированном JSON-формате:
+  - `answer`
+  - `confidence`
+  - `evidence_ids`
+- Если уверенность ниже `MIN_CONFIDENCE`, пайплайн возвращает явный ответ о том, что в документе нет данных для ответа.
+- Для некоторых ситуаций перед LLM есть generic grounded-rules слой: он закрывает типовые случаи вроде false premise, missing fact и prompt injection без жёсткой привязки к конкретному документу.
+- Если включён `ENABLE_ANSWER_VERIFIER=1`, после генерации запускается дополнительный проход verifier для сокращения, очистки формата и повышения ясности ответа.
+
 Текущий retrieval-слой уже включает несколько generic-улучшений поверх базового RAG:
 - `query rewriting` и `multi-query retrieval`;
 - адаптивную retrieval-политику по типу вопроса;
