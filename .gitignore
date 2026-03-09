@@ -1,0 +1,38 @@
+# Environment
+.env
+!.env.example
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Generated outputs (run results — not committed)
+answers_submission*.csv
+answers_debug*.csv
+answers_new*.csv
+test/output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+# Local process and cleanup parking area
+test/local/
+.scratchpad/
+coordination/
+.agent-memory/
+submission_python_files.zip
+submission_ready.csv
+test_set_*.xlsx
+*.rar
